@@ -5,8 +5,8 @@
  ========================
 
  @file      : pushNotifications.js
- @version   : 2.3.0
- @author    : Simon Black & Kevin Vlaanderen
+ @version   : 2.4.0
+ @author    : Simon Black & Kevin Vlaanderen & Derrick Kwagala
  @date      : Thu, 30 Jun 2016 10:59 CEST
  @copyright :
  @license   :
@@ -33,6 +33,7 @@ define([
     return declare("pushNotifications.widget.pushNotifications", [_WidgetBase, _TemplatedMixin], {
         // _TemplatedMixin will create our dom node using this HTML template.
         templateString: widgetTemplate,
+        notificationActions: [{ actionName: "", actionType: "", contextEntity: "", page: "", microflow:""}],
 
         // Constants (needed to work around the fact that you cannot use entity paths in offline mode)
         DEVICE_REGISTRATION_ENTITY: "PushNotifications.DeviceRegistration",
@@ -54,15 +55,16 @@ define([
         _push: null,
 
         version: "",
+        progressId: null,
 
         // dojo.declare.constructor is called to construct the widget instance. Implement to initialize non-primitive properties.
         constructor: function() {
-            // logger.level(window.logger.ALL);
+            logger.level(window.logger.ALL);
         },
 
         // dijit._WidgetBase.postCreate is called after constructing the widget. Implement to do extra setup work.
         postCreate: function() {
-            logger.debug(".postCreate");
+            logger.debug(this.id + ".postCreate");
 
             this.version =  this._parseVersionString(mx.version);
 
@@ -98,7 +100,7 @@ define([
             .then(dojoLang.hitch(this, this.initializePushPlugin))
             .then(dojoLang.hitch(this, this.removeRetryInterval))
             .otherwise(dojoLang.hitch(this, function (err) {
-                // We were not able to register our device. Let's set up an interval that keeps trying.
+                // We were not able to register our device. var's set up an interval that keeps trying.
                 if (typeof this._initIntervalHandle !== "number") {
                     this._initIntervalHandle = window.setInterval(
                         dojoLang.hitch(this, this.initializePushNotifications),
@@ -183,9 +185,11 @@ define([
                     "senderID": this._gcmSenderId
                 },
                 "ios": {
+                    "senderID": this._gcmSenderId,
                     "alert": "true",
                     "badge": "true",
-                    "sound": "true"
+                    "sound": "true",
+                    "gcmSandbox": "true"
                 },
                 "windows": {}
             });
@@ -215,7 +219,7 @@ define([
 
             var deferred = new Deferred();
 
-            var handleRegistrationEntity = function(deviceregistrations, count) {
+            var handleRegistrationEntity = function (deviceregistrations, count) {
                 if (deviceregistrations.length > 0) {
                     logger.debug("Found one or more device registration objects. Using the first one.");
 
@@ -310,21 +314,27 @@ define([
 
         onPushNotification: function (data) {
             logger.debug(".onPushNotification");
+            var alertData = Object.assign({},data.additionalData);
 
-            var cards = document.getElementById("cards");
-            var card = '' +
-                '<div class="alert alert-info alert-dismissible animated fadeInDown" role="alert">' +
-                '<button type="button" class="close" data-dismiss="alert" aria-label="Close" onClick="window.pushWidget.removeAlert(this);">' +
-                '<span aria-hidden="true">&times;</span>' +
-                '</button>' +
-                data.message +
-                '</div>';
+            if (alertData.foreground) {
+                var cards = document.getElementById("cards");
 
-            var cardList = cards.childNodes;
-            for(var i = 0; i < cardList.length; i++){
-                cardList[i].className = "alert alert-info alert-dismissible";
+                // TODO: use dojo.domConstruct to create this.
+                var card = `<div class="alert alert-info alert-dismissible animated fadeInDown" role="alert" onClick='window.pushWidget.onClickAlert(${JSON.stringify(alertData)},this)'>` +
+                    '<button type="button" class="close" data-dismiss="alert" aria-label="Close" onClick="window.pushWidget.removeAlert(this);">' +
+                    '<span aria-hidden="true">&times;</span>' +
+                    '</button>' +
+                    alertData.text +
+                    '</div>';
+
+                var cardList = cards.childNodes;
+                for(var i = 0; i < cardList.length; i++){
+                    cardList[i].className = "alert alert-info alert-dismissible";
+                }
+                cards.innerHTML += card;
+            } else {
+                this.onClickAlert(alertData);
             }
-            cards.innerHTML += card;
 
             this._push.finish(function () {
                 logger.debug('Successfully processed push notification.');
@@ -335,8 +345,103 @@ define([
             logger.error("Push error: " + e);
         },
 
-        removeAlert: function (e){
+        removeAlert: function (e) {
             e.parentNode.parentNode.removeChild(e.parentNode);
+        },
+
+        onClickAlert: function (data, e) {
+            var action = null;
+            var callback = dojoLang.hitch(this, function () {
+                if(e) {
+                    this.removeAlert(e.childNodes[0]);
+                }
+            });
+
+            for (var index = 0; index < this.notificationActions.length; index++){
+                if(this.notificationActions[index].actionName === data.actionName) {
+                    action = this.notificationActions[index];
+                    break;
+                }
+            }
+
+            if (!action) {
+                callback();
+                return;
+            }
+
+            try {
+                var { contextEntity, actionType, microflow, page } = action;
+                var guid = data.guid;
+                var context = new mendix.lib.MxContext();
+                context.setContext(contextEntity, guid);
+
+                if (actionType === "openPage" && page && contextEntity && guid) {
+                        window.mx.ui.openForm(page, {
+                            callback,
+                            context,
+                            error: function (error) {
+                                window.mx.ui.error("Error while opening page " + page +": "+ error.message);
+                            }
+                        });
+                } else if (actionType === "callMicroflow" && microflow && contextEntity && guid) {
+                    window.mx.ui.action(microflow, {
+                        callback,
+                        error: function (error) {
+                            window.mx.ui.error("Error while opening page " + microflow +": "+ error.message);
+                        },
+                        params: {
+                            applyto: "selection",
+                            guids: [ guid ],
+                            mxform: this.mxform
+                        }
+                    });
+                } else if(actionType === "openPage" && page && !guid) {
+                    window.mx.ui.openForm(page, {
+                        callback,
+                        error: function (error) {
+                            window.mx.ui.error("Error while opening page " + page +": "+ error.message);
+                        }
+                    });
+                } else if (actionType === "callMicroflow" && microflow && !guid) {
+                    window.mx.ui.action(microflow, {
+                        callback,
+                        error: function (error) {
+                            window.mx.ui.error("Error while opening page " + microflow +": "+ error.message);
+                        }
+                    });
+                } else {
+                    callback();
+                }
+            } catch(e) {
+                mx.ui.confirmation( {
+                    content: "Synchronize this application with the server?",
+                    proceed: "Yes",
+                    cancel: "No",
+                    handler: this.offlineSync.bind(this)
+                });
+            }
+        },
+
+        offlineSync: function () {
+            var progressId = window.mx.ui.showProgress(null, true);
+            var onSyncSuccess = function(callback) {
+                if (progressId) {
+                    window.mx.ui.hideProgress(progressId);
+                }
+                if (callback) callback();
+            };
+            var onSyncFailure = function() {
+                window.mx.ui.info(window.mx.ui.translate("mxui.sys.UI", "sync_error"), true);
+            };
+
+            onSyncSuccess = onSyncSuccess.bind(this);
+            onSyncFailure = onSyncFailure.bind(this);
+
+            if (window.mx.data.synchronizeOffline) {
+                window.mx.data.synchronizeOffline({ fast: false }, onSyncSuccess, onSyncFailure);
+            } else if (window.mx.data.synchronizeDataWithFiles) {
+                window.mx.data.synchronizeDataWithFiles(onSyncSuccess, onSyncFailure);
+            }
         },
 
         _executeOfflineOnline: function (offlineFn, onlineFn) {
@@ -350,7 +455,7 @@ define([
                 /*
                  mx.data.getSlice is only available in the offline (client-side) backend.
                  Unfortunately, we have no way of knowing if we're running in offline mode.
-                 Let's try to use getSlice first, and fall back to an xpath retrieve if it fails.
+                 var's try to use getSlice first, and fall back to an xpath retrieve if it fails.
                  */
                 try {
                     offlineFn();
@@ -360,7 +465,7 @@ define([
             }
         },
 
-        _getSliceCompat: function(entity, contraints, filter, success, error) {
+        _getSliceCompat: function(entity, constraints, filter, success, error) {
             if (this.version.major > 7 || (this.version.major === 7 && this.version.minor >= 3)) {
                 mx.data.getSlice(entity, constraints, filter, true, success, error); // caching, introduced in 7.3
             } else {
